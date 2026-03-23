@@ -1,0 +1,20 @@
+{
+    "name": "cc_attention_softmax_dropout_value_matmul_backward",
+    "definition": "attention_softmax_dropout_value_matmul_backward",
+    "author": "cc",
+    "spec": {
+      "languages": ["cuda_cpp"],
+      "target_hardware": [
+        "B200",
+        "LOCAL"
+      ],
+      "entry_point": "main.cpp::run",
+      "dependencies": [],
+      "destination_passing_style": false,
+      "binding": "torch"
+    },
+    "sources": [
+    ],
+    "description": "",
+    "round_dir": "round_0"
+  }
