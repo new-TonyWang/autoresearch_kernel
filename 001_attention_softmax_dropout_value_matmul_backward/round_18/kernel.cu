@@ -44,9 +44,9 @@ fused_dropout_softmax_backward_kernel(
 
     for (int sk = tid; sk < seq_len_kv; sk += BLOCK_SIZE) {
         float raw = __ldg(&grad_aw_dropped[row_off + sk]);
-        bool mask = __ldg(&dropout_mask[row_off + sk]);
+        bool mask = dropout_mask[row_off + sk];
         float gw = mask ? raw * dropout_scale : 0.0f;
-        float aw = __bfloat162float(__ldg(reinterpret_cast<const __nv_bfloat16*>(&attn_weights[row_off + sk])));
+        float aw = __bfloat162float(*(reinterpret_cast<const __nv_bfloat16*>(&attn_weights[row_off + sk])));
 
         gw_regs[n] = gw;
         aw_regs[n] = aw;
