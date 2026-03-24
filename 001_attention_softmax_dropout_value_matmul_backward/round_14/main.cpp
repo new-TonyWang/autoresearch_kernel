@@ -28,6 +28,8 @@ std::vector<torch::Tensor> run(
 
     // ============================================================
     // Output 1: grad_attn_scores  (fused custom CUDA kernel)
+    // Fuses: matmul(grad_out, V^T) + dropout_backward + softmax_backward
+    // No atomicAdd, no intermediate allocations.
     // ============================================================
     auto grad_attn_scores = torch::empty_like(attn_weights);
 
@@ -41,31 +43,27 @@ std::vector<torch::Tensor> run(
     );
 
     // ============================================================
-    // Output 2: grad_value_states  (bf16 matmul on tensor cores)
-    // Avoids expensive .to(float32) of the huge attention tensors.
-    // bf16 tensor cores accumulate in fp32 internally.
+    // Output 2: grad_value_states  (via torch::matmul on tensor cores)
+    // grad_v_expanded = attn_weights_dropped^T @ grad_attn_output_transposed
+    // Then GQA aggregation: sum over 10 heads per kv_head group.
     // ============================================================
 
-    // Transpose + contiguous (bf16 copy, 2x smaller than f32 conversion)
-    // .contiguous() is needed because cuBLAS batch strides require it
-    auto grad_out_t = grad_attn_output.transpose(1, 2).contiguous();  // (B, 80, sq, 128) bf16
-    auto awd_t = attn_weights_dropped.transpose(-2, -1).contiguous(); // (B, 80, sk, sq) bf16
+    // Transpose to (batch, heads, seq_q, head_dim) and (batch, heads, seq_kv, seq_q)
+    // Use float32 for matmul precision matching reference
+    auto grad_out_t = grad_attn_output.transpose(1, 2).to(torch::kFloat32);
+    auto awd_f32    = attn_weights_dropped.to(torch::kFloat32);
+    auto awd_t      = awd_f32.transpose(-2, -1);
 
-    // bf16 batched matmul: (B, 80, sk, sq) @ (B, 80, sq, 128) -> (B, 80, sk, 128)
-    // Uses tensor cores with internal fp32 accumulation
+    // Batched matmul: (B, 80, seq_kv, seq_q) @ (B, 80, seq_q, 128) -> (B, 80, seq_kv, 128)
     auto grad_v_expanded = torch::matmul(awd_t, grad_out_t);
 
-    // GQA aggregation: sum groups in float32 for precision
-    // (B, 80, sk, 128) -> (B, 8, 10, sk, 128) -> sum dim 2 -> (B, 8, sk, 128)
-    grad_v_expanded = grad_v_expanded.reshape(
-        {batch_size, num_kv_heads, num_groups, seq_len_kv, head_dim});
-    auto grad_value_states = grad_v_expanded.to(torch::kFloat32)
-                             .sum(2)
-                             .to(torch::kBFloat16);
+    // GQA aggregation: (B, 8, 10, seq_kv, 128) -> sum dim 2 -> (B, 8, seq_kv, 128)
+    grad_v_expanded = grad_v_expanded.reshape({batch_size, num_kv_heads, num_groups, seq_len_kv, head_dim});
+    auto grad_value_states = grad_v_expanded.sum(2).to(torch::kBFloat16);
 
     return {grad_attn_scores, grad_value_states};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run", &run, "Attention backward v13 - bf16 matmul for grad_value");
+    m.def("run", &run, "Attention backward v12 - fused grad_scores + matmul grad_value");
 }
