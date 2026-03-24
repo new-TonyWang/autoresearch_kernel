@@ -7,7 +7,6 @@
       "cuda_cpp"
     ],
     "target_hardware": [
-      "B200",
       "LOCAL"
     ],
     "entry_point": "main.cpp::run",
