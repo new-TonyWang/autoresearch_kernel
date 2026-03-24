@@ -7,7 +7,7 @@
 
 void attention_backward_launcher(
     torch::Tensor& grad_attn_scores,
-    torch::Tensor& grad_value_states,
+    torch::Tensor& grad_value_states_f32,
     const torch::Tensor& grad_attn_output,
     const torch::Tensor& attn_weights,
     const torch::Tensor& attn_weights_dropped,

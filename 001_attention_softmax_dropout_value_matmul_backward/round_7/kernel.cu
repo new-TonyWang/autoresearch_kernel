@@ -18,7 +18,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 // Safe, aligned kernel - no vectorized loads
 __global__ void __launch_bounds__(256, 4) attention_backward_v7(
     __nv_bfloat16* __restrict__ grad_attn_scores,
-    __nv_bfloat16* __restrict__ grad_value_states,
+    float* __restrict__ grad_value_states,
     const __nv_bfloat16* __restrict__ grad_attn_output,
     const __nv_bfloat16* __restrict__ attn_weights,
     const __nv_bfloat16* __restrict__ attn_weights_dropped,
@@ -100,19 +100,19 @@ __global__ void __launch_bounds__(256, 4) attention_backward_v7(
         float grad_score = aw * (gw - total_sum);
         grad_attn_scores[woff + sk] = __float2bfloat16(grad_score);
         
-        // Accumulate grad_value
+        // Accumulate grad_value (grad_value_states is float32 for safe atomicAdd)
         float awd = __bfloat162float(attn_weights_dropped[woff + sk]);
         #pragma unroll 8
         for (int d = 0; d < HEAD_DIM; ++d) {
             float val = awd * s_grad_out[d];
-            atomicAdd(reinterpret_cast<float*>(&grad_value_states[voff + sk * HEAD_DIM + d]), val);
+            atomicAdd(&grad_value_states[voff + sk * HEAD_DIM + d], val);
         }
     }
 }
 
 void attention_backward_launcher(
     torch::Tensor& grad_attn_scores,
-    torch::Tensor& grad_value_states,
+    torch::Tensor& grad_value_states_f32,
     const torch::Tensor& grad_attn_output,
     const torch::Tensor& attn_weights,
     const torch::Tensor& attn_weights_dropped,
@@ -125,7 +125,7 @@ void attention_backward_launcher(
     const int seq_len_q = grad_attn_output.size(1);
     const int seq_len_kv = value_states.size(2);
     
-    grad_value_states.zero_();
+    grad_value_states_f32.zero_();
     
     const float dropout_scale = attention_dropout > 0.0f ? 1.0f / (1.0f - attention_dropout) : 1.0f;
     
@@ -134,7 +134,7 @@ void attention_backward_launcher(
     
     attention_backward_v7<<<grid, block, 0, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(grad_attn_scores.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16*>(grad_value_states.data_ptr<at::BFloat16>()),
+        grad_value_states_f32.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(grad_attn_output.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(attn_weights.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(attn_weights_dropped.data_ptr<at::BFloat16>()),

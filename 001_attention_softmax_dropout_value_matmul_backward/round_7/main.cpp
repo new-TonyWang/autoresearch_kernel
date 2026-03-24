@@ -14,16 +14,18 @@ std::vector<torch::Tensor> run(
     TORCH_CHECK(grad_attn_output.dtype() == torch::kBFloat16, "bfloat16 required");
     
     auto grad_attn_scores = torch::empty_like(attn_weights);
-    auto grad_value_states = torch::zeros_like(value_states);
+    auto grad_value_states_f32 = torch::zeros(
+        value_states.sizes(), value_states.options().dtype(torch::kFloat32));
     
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     attention_backward_launcher(
-        grad_attn_scores, grad_value_states,
+        grad_attn_scores, grad_value_states_f32,
         grad_attn_output, attn_weights, attn_weights_dropped,
         value_states, dropout_mask,
         static_cast<float>(attention_dropout), stream
     );
     
+    auto grad_value_states = grad_value_states_f32.to(torch::kBFloat16);
     return {grad_attn_scores, grad_value_states};
 }
 
