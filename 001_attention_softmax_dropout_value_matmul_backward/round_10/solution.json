@@ -1,0 +1,32 @@
+{
+  "name": "attention_backward_cuda_v10",
+  "definition": "001_attention_softmax_dropout_value_matmul_backward",
+  "author": "optimization_agent",
+  "spec": {
+    "languages": [
+      "cuda_cpp"
+    ],
+    "target_hardware": [
+      "LOCAL"
+    ],
+    "entry_point": "main.cpp::run",
+    "dependencies": [],
+    "destination_passing_style": false,
+    "binding": "torch"
+  },
+  "sources": [
+    {
+      "path": "kernel.h",
+      "content": "#pragma once\n\n#ifndef ATTENTION_BACKWARD_KERNEL_H\n#define ATTENTION_BACKWARD_KERNEL_H\n\n#include <torch/extension.h>\n\nvoid attention_backward_launcher(\n    torch::Tensor& grad_attn_scores,\n    torch::Tensor& grad_value_states_f32,\n    const torch::Tensor& grad_attn_output,\n    const torch::Tensor& attn_weights,\n    const torch::Tensor& attn_weights_dropped,\n    const torch::Tensor& value_states,\n    const torch::Tensor& dropout_mask,\n    float attention_dropout,\n    cudaStream_t stream\n);\n\n#endif\n"
+    },
+    {
+      "path": "kernel.cu",
+      "content": "#include \"kernel.h\"\n#include <cuda_runtime.h>\n#include <cuda_bf16.h>\n\nconstexpr int NUM_HEADS = 80;\nconstexpr int NUM_KV_HEADS = 8;\nconstexpr int NUM_GROUPS = 10;\nconstexpr int HEAD_DIM = 128;\n\n__device__ __forceinline__ float warp_sum(float v) {\n    #pragma unroll for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffff, v, m);\n    return v;\n}\n\n// ROUND 10: Debugging version to fix numerical issues\n__global__ void __launch_bounds__(256, 4) attn_bw_v10(\n    __nv_bfloat16* __restrict__ gs, float* __restrict__ gv,\n    const __nv_bfloat16* __restrict__ go, const __nv_bfloat16* __restrict__ aw,\n    const __nv_bfloat16* __restrict__ ad, const __nv_bfloat16* __restrict__ vs,\n    const bool* __restrict__ dm, const int B, const int seq_q, const int seq_kv,\n    const float ds) {\n    \n    const int b = blockIdx.x, h = blockIdx.y, q = blockIdx.z;\n    if (b >= B || h >= NUM_HEADS || q >= seq_q) return;\n    \n    const int kh = h / NUM_GROUPS;\n    const int tid = threadIdx.x, lane = tid & 31;\n    \n    const int goff = ((b * seq_q + q) * NUM_HEADS + h) * HEAD_DIM;\n    const int woff = ((b * NUM_HEADS + h) * seq_q + q) * seq_kv;\n    const int voff = ((b * NUM_KV_HEADS + kh) * seq_kv) * HEAD_DIM;\n    \n    __shared__ float sg[HEAD_DIM], ss;\n    // Load grad_output\n    #pragma unroll 4 for (int d = tid; d < HEAD_DIM; d += 256) sg[d] = __bfloat162float(go[goff + d]);\n    if (!tid) ss = 0.0f;\n    __syncthreads();\n    \n    float ls = 0.0f;\n    \n    // SIMPLIFIED: Single pass with strided access\n    for (int sk = tid; sk < seq_kv; sk += 256) {\n        float dot = 0.0f;\n        #pragma unroll 16 for (int i = 0; i < HEAD_DIM; ++i) dot += sg[i] * __bfloat162float(vs[voff + sk * HEAD_DIM + i]);\n        \n        bool m = dm[woff + sk];\n        float g = m ? dot * ds : 0.0f;\n        float a = __bfloat162float(aw[woff + sk]);\n        ls += g * a;\n        \n        float av = __bfloat162float(ad[woff + sk]);\n        #pragma unroll 16 for (int i = 0; i < HEAD_DIM; ++i) atomicAdd(&gv[voff + sk * HEAD_DIM + i], av * sg[i]);\n    }\n    \n    // Reduce\n    ls = warp_sum(ls);\n    if (!lane) atomicAdd(&ss, ls);\n    __syncthreads();\n    \n    float ts = ss;\n    \n    // Second pass for grad_scores\n    for (int sk = tid; sk < seq_kv; sk += 256) {\n        float dot = 0.0f;\n        #pragma unroll 16 for (int i = 0; i < HEAD_DIM; ++i) dot += sg[i] * __bfloat162float(vs[voff + sk * HEAD_DIM + i]);\n        \n        bool m = dm[woff + sk];\n        float g = m ? dot * ds : 0.0f;\n        float a = __bfloat162float(aw[woff + sk]);\n        gs[woff + sk] = __float2bfloat16(a * (g - ts));\n    }\n}\n\nvoid attention_backward_launcher(torch::Tensor& gs, torch::Tensor& gv_f32, const torch::Tensor& go,\n    const torch::Tensor& aw, const torch::Tensor& ad, const torch::Tensor& vs,\n    const torch::Tensor& dm, float do_, cudaStream_t stream) {\n    const int B = go.size(0), seq_q = go.size(1), seq_kv = vs.size(2);\n    gv_f32.zero_();\n    float ds = do_ > 0.0f ? 1.0f / (1.0f - do_) : 1.0f;\n    attn_bw_v10<<<dim3(B, NUM_HEADS, seq_q), 256, 0, stream>>>(\n        reinterpret_cast<__nv_bfloat16*>(gs.data_ptr<at::BFloat16>()),\n        gv_f32.data_ptr<float>(),\n        reinterpret_cast<const __nv_bfloat16*>(go.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(aw.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(ad.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(vs.data_ptr<at::BFloat16>()),\n        dm.data_ptr<bool>(), B, seq_q, seq_kv, ds);\n}\n"
+    },
+    {
+      "path": "main.cpp",
+      "content": "#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n#include \"kernel.h\"\n\nstd::vector<torch::Tensor> run(\n    const torch::Tensor& grad_attn_output,\n    const torch::Tensor& attn_weights,\n    const torch::Tensor& attn_weights_dropped,\n    const torch::Tensor& value_states,\n    const torch::Tensor& dropout_mask,\n    double attention_dropout\n) {\n    TORCH_CHECK(grad_attn_output.is_cuda(), \"CUDA required\");\n    TORCH_CHECK(grad_attn_output.dtype() == torch::kBFloat16, \"bfloat16 required\");\n    \n    auto grad_attn_scores = torch::empty_like(attn_weights);\n    auto grad_value_states_f32 = torch::zeros(\n        value_states.sizes(), value_states.options().dtype(torch::kFloat32));\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream();\n    attention_backward_launcher(\n        grad_attn_scores, grad_value_states_f32,\n        grad_attn_output, attn_weights, attn_weights_dropped,\n        value_states, dropout_mask,\n        static_cast<float>(attention_dropout), stream\n    );\n    \n    auto grad_value_states = grad_value_states_f32.to(torch::kBFloat16);\n    return {grad_attn_scores, grad_value_states};\n}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def(\"run\", &run, \"Attention backward v7\");\n}\n"
+    }
+  ],
+  "description": "Round 10: Simplified strided access for debugging numerical issues"
+}
