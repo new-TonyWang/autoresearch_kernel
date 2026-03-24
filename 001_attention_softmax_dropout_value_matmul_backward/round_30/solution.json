@@ -1,0 +1,32 @@
+{
+  "name": "attention_backward_cuda_v30",
+  "definition": "001_attention_softmax_dropout_value_matmul_backward",
+  "author": "optimization_agent",
+  "spec": {
+    "languages": [
+      "cuda_cpp"
+    ],
+    "target_hardware": [
+      "LOCAL"
+    ],
+    "entry_point": "main.cpp::run",
+    "dependencies": [],
+    "destination_passing_style": false,
+    "binding": "torch"
+  },
+  "sources": [
+    {
+      "path": "kernel.h",
+      "content": "#pragma once\n\n#ifndef ATTENTION_BACKWARD_KERNEL_H\n#define ATTENTION_BACKWARD_KERNEL_H\n\n#include <torch/extension.h>\n\nvoid attention_backward_launcher(\n    torch::Tensor& grad_attn_scores,\n    torch::Tensor& grad_value_states,\n    const torch::Tensor& grad_attn_output,\n    const torch::Tensor& attn_weights,\n    const torch::Tensor& attn_weights_dropped,\n    const torch::Tensor& value_states,\n    const torch::Tensor& dropout_mask,\n    float attention_dropout,\n    cudaStream_t stream\n);\n\n#endif\n"
+    },
+    {
+      "path": "kernel.cu",
+      "content": "#include \"kernel.h\"\n#include <cuda_runtime.h>\n#include <cuda_bf16.h>\n\nconstexpr int N_HEADS = 80;\nconstexpr int N_KV_HEADS = 8;\nconstexpr int N_GROUPS = 10;\nconstexpr int H_DIM = 128;\nconstexpr int WARP_SZ = 32;\n\n__device__ __forceinline__ float warp_sum(float v) {\n    #pragma unroll for (int m = 16; m > 0; m >>= 1) v += __shfl_xor_sync(0xffffffff, v, m);\n    return v;\n}\n\n__global__ void __launch_bounds__(256, 8) attn_bw_v30(\n    __nv_bfloat16* gs, float* gv, const __nv_bfloat16* go,\n    const __nv_bfloat16* aw, const __nv_bfloat16* ad, const __nv_bfloat16* vs,\n    const bool* dm, int B, int sq, int sv, float ds) {\n    \n    const int b = blockIdx.x, h = blockIdx.y, q = blockIdx.z;\n    if (b >= B || h >= N_HEADS || q >= sq) return;\n    \n    const int kh = h / N_GROUPS;\n    const int tid = threadIdx.x, lane = tid % WARP_SZ, warp = tid / WARP_SZ;\n    const int goff = ((b * sq + q) * N_HEADS + h) * H_DIM;\n    const int woff = ((b * N_HEADS + h) * sq + q) * sv;\n    const int voff = ((b * N_KV_HEADS + kh) * sv) * H_DIM;\n    const int aoff = ((b * N_KV_HEADS + kh) * sv) * H_DIM;\n    \n    __shared__ float sg[H_DIM], ss;\n    \n    #pragma unroll 4\n    for (int d = tid; d < H_DIM; d += 256) sg[d] = __bfloat162float(go[goff + d]);\n    if (!tid) ss = 0.0f;\n    __syncthreads();\n    \n    const int nw = 8; // 256/32\n    const int per_w = (sv + nw - 1) / nw;\n    const int s0 = warp * per_w;\n    const int s1 = min(s0 + per_w, sv);\n    \n    float lsum = 0.0f;\n    \n    // First pass\n    for (int s = s0 + lane; s < s1; s += WARP_SZ) {\n        float d = 0.0f;\n        #pragma unroll 32\n        for (int i = 0; i < H_DIM; ++i) d += sg[i] * __bfloat162float(vs[voff + s * H_DIM + i]);\n        bool m = dm[woff + s];\n        float g = m ? d * ds : 0.0f;\n        lsum += g * __bfloat162float(aw[woff + s]);\n        float a = __bfloat162float(ad[woff + s]);\n        #pragma unroll 32\n        for (int i = 0; i < H_DIM; ++i) atomicAdd(&gv[aoff + s * H_DIM + i], a * sg[i]);\n    }\n    \n    // Reduce\n    lsum = warp_sum(lsum);\n    __shared__ float sp[8];\n    if (!lane) sp[warp] = lsum;\n    __syncthreads();\n    if (!warp) {\n        lsum = (lane < 8) ? sp[lane] : 0.0f;\n        lsum = warp_sum(lsum);\n        if (!lane) ss = lsum;\n    }\n    __syncthreads();\n    float ts = ss;\n    \n    // Second pass\n    for (int s = s0 + lane; s < s1; s += WARP_SZ) {\n        float d = 0.0f;\n        #pragma unroll 32\n        for (int i = 0; i < H_DIM; ++i) d += sg[i] * __bfloat162float(vs[voff + s * H_DIM + i]);\n        bool m = dm[woff + s];\n        float g = m ? d * ds : 0.0f;\n        float av = __bfloat162float(aw[woff + s]);\n        gs[woff + s] = __float2bfloat16(av * (g - ts));\n    }\n}\n\n__global__ void __launch_bounds__(256, 4) cv2bf16(__nv_bfloat16* o, const float* i, int n) {\n    int x = blockIdx.x * 256 + threadIdx.x;\n    if (x < n) o[x] = __float2bfloat16(i[x]);\n}\n\nvoid attention_backward_launcher(torch::Tensor& gs, torch::Tensor& gv, const torch::Tensor& go,\n    const torch::Tensor& aw, const torch::Tensor& ad, const torch::Tensor& vs,\n    const torch::Tensor& dm, float do_, cudaStream_t s) {\n    const int B = go.size(0), sq = go.size(1), sv = vs.size(2);\n    const float ds = do_ > 0.0f ? 1.0f / (1.0f - do_) : 1.0f;\n    \n    auto ga = torch::zeros({B, N_KV_HEADS, sv, H_DIM},\n        torch::TensorOptions().dtype(torch::kFloat32).device(gv.device()));\n    \n    attn_bw_v30<<<dim3(B, N_HEADS, sq), 256, 0, s>>>(\n        reinterpret_cast<__nv_bfloat16*>(gs.data_ptr<at::BFloat16>()),\n        ga.data_ptr<float>(),\n        reinterpret_cast<const __nv_bfloat16*>(go.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(aw.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(ad.data_ptr<at::BFloat16>()),\n        reinterpret_cast<const __nv_bfloat16*>(vs.data_ptr<at::BFloat16>()),\n        dm.data_ptr<bool>(), B, sq, sv, ds);\n    \n    cv2bf16<<<(gv.numel() + 255) / 256, 256, 0, s>>>(\n        reinterpret_cast<__nv_bfloat16*>(gv.data_ptr<at::BFloat16>()),\n        ga.data_ptr<float>(), gv.numel());\n}\n"
+    },
+    {
+      "path": "main.cpp",
+      "content": "#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n#include \"kernel.h\"\n\nstd::vector<torch::Tensor> run(\n    const torch::Tensor& grad_attn_output,\n    const torch::Tensor& attn_weights,\n    const torch::Tensor& attn_weights_dropped,\n    const torch::Tensor& value_states,\n    const torch::Tensor& dropout_mask,\n    double attention_dropout\n) {\n    TORCH_CHECK(grad_attn_output.is_cuda(), \"CUDA required\");\n    TORCH_CHECK(grad_attn_output.dtype() == torch::kBFloat16, \"bfloat16 required\");\n    \n    auto grad_attn_scores = torch::empty_like(attn_weights);\n    auto grad_value_states = torch::zeros_like(value_states);\n    \n    cudaStream_t stream = at::cuda::getCurrentCUDAStream();\n    attention_backward_launcher(\n        grad_attn_scores, grad_value_states,\n        grad_attn_output, attn_weights, attn_weights_dropped,\n        value_states, dropout_mask,\n        static_cast<float>(attention_dropout), stream\n    );\n    \n    return {grad_attn_scores, grad_value_states};\n}\n\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n    m.def(\"run\", &run, \"Attention backward v16\");\n}\n"
+    }
+  ],
+  "description": "Round 30: Final optimized version with maximum occupancy and full unrolling"
+}
