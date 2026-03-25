@@ -187,42 +187,33 @@ constexpr int GV_BM = 64, GV_BN = 128, GV_KT = 16, GV_BLOCK = 256;
 constexpr int GV_APAD = 8, GV_BPAD = 8;
 constexpr int GV_AS = GV_BM + GV_APAD, GV_BS = GV_BN + GV_BPAD;
 
-// Helper: async load awd + go tiles via cp.async
-__device__ __forceinline__ void gv_async_load_tile(
+// Helper: load awd (regular, may be misaligned) + go (cp.async, always aligned)
+__device__ __forceinline__ void gv_load_tile(
     __nv_bfloat16* s_A, __nv_bfloat16* s_B,
     const __nv_bfloat16* awd, const __nv_bfloat16* go,
     int b, int h, int kv_head, int sk_start, int sq_off, int seq_q, int seq_kv,
     int tid
 ) {
-    // A tile: GV_KT × GV_BM bf16 = 16 × 64 = 1024 elements
-    // Load as 128 × 16-byte copies (8 bf16 each)
-    // B tile: GV_KT × GV_BN = 16 × 128 = 2048 elements
-    // Load as 256 × 16-byte copies
-
-    // Total: 384 copies. With 256 threads: ~1.5 copies per thread.
-    // Split: A gets first 128 copies, B gets next 256 copies → 384 total
-
-    // A: 16 rows × (64/8) = 16 × 8 = 128 copies
-    if (tid < 128) {
-        int row = tid / 8;       // 0..15 (K dim = sq offset)
-        int chunk = tid % 8;     // 0..7 (M dim = sk, 8 chunks of 8)
-        int sq = sq_off + row;
-        int sk = sk_start + chunk * 8;
-        __nv_bfloat16* dst = &s_A[row * GV_AS + chunk * 8];
-        if (sq < seq_q && sk + 7 < seq_kv) {
-            long long src_off = ((long long)(b*NUM_HEADS+h)*seq_q+sq)*seq_kv + sk;
-            __pipeline_memcpy_async(dst, &awd[src_off], 16);
+    // A (awd): regular loads (seq_kv stride may not be 16-byte aligned)
+    for (int idx = tid; idx < GV_KT * GV_BM; idx += GV_BLOCK) {
+        int kl = idx / GV_BM, sk_l = idx % GV_BM;
+        int sq = sq_off + kl, sk = sk_start + sk_l;
+        __nv_bfloat16 val = {};
+        if (kl < min(GV_KT, seq_q - sq_off) && sk < seq_kv) {
+            long long off = ((long long)(b*NUM_HEADS+h)*seq_q+sq)*seq_kv+sk;
+            val = awd[off];
         }
+        s_A[kl * GV_AS + sk_l] = val;
     }
 
-    // B: 16 rows × (128/8) = 16 × 16 = 256 copies
-    if (tid < 256) {
-        int b_idx = tid;  // all 256 threads handle B
-        int row = b_idx / 16;    // 0..15 (K dim = sq offset)
-        int chunk = b_idx % 16;  // 0..15 (N dim = d, 16 chunks of 8)
+    // B (go): cp.async 16-byte copies (HEAD_DIM stride always 16-byte aligned)
+    // 16 rows × 16 chunks of 8 = 256 copies, 256 threads → 1 per thread
+    {
+        int row = tid / 16;
+        int chunk = tid % 16;
         int sq = sq_off + row;
         __nv_bfloat16* dst = &s_B[row * GV_BS + chunk * 8];
-        if (sq < seq_q) {
+        if (row < GV_KT && sq < seq_q) {
             long long src_off = ((long long)(b*seq_q+sq)*NUM_HEADS+h)*HEAD_DIM + chunk*8;
             __pipeline_memcpy_async(dst, &go[src_off], 16);
         }
@@ -265,41 +256,28 @@ grad_value_wmma_kernel(
 
     for (int h_local = 0; h_local < NUM_GROUPS; ++h_local) {
         const int h = kv_head * NUM_GROUPS + h_local;
-        const int total_sq_steps = (seq_q + GV_KT - 1) / GV_KT;
 
-        // Preload first sq chunk
-        int sq0 = 0;
-        gv_async_load_tile(SA(0), SB(0), awd, go, b, h, kv_head, sk_start, sq0, seq_q, seq_kv, tid);
-        __pipeline_commit();
-
-        for (int sq_step = 0; sq_step < total_sq_steps; ++sq_step) {
-            int cur = sq_step & 1;
-            int nxt = 1 - cur;
-
+        for (int sq_start = 0; sq_start < seq_q; sq_start += GV_KT) {
+            // Load: awd (regular) + go (cp.async)
+            gv_load_tile(SA(0), SB(0), awd, go, b, h, kv_head, sk_start,
+                         sq_start, seq_q, seq_kv, tid);
+            __pipeline_commit();
             __pipeline_wait_prior(0);
             __syncthreads();
-
-            // Start loading next sq chunk
-            if (sq_step + 1 < total_sq_steps) {
-                int next_sq = (sq_step + 1) * GV_KT;
-                gv_async_load_tile(SA(nxt), SB(nxt), awd, go, b, h, kv_head, sk_start,
-                                   next_sq, seq_q, seq_kv, tid);
-                __pipeline_commit();
-            }
 
             // WMMA compute
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a_frag;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b_frag[4];
 
-            wmma::load_matrix_sync(a_frag, &SA(cur)[wm * 16], GV_AS);
+            wmma::load_matrix_sync(a_frag, &SA(0)[wm * 16], GV_AS);
             #pragma unroll
             for (int ni = 0; ni < 4; ++ni)
-                wmma::load_matrix_sync(b_frag[ni], &SB(cur)[wn*64+ni*16], GV_BS);
+                wmma::load_matrix_sync(b_frag[ni], &SB(0)[wn*64+ni*16], GV_BS);
             #pragma unroll
             for (int ni = 0; ni < 4; ++ni)
                 wmma::mma_sync(c_frag[ni], a_frag, b_frag[ni], c_frag[ni]);
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     #undef SA
